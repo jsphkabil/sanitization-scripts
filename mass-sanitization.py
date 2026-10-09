@@ -1,24 +1,47 @@
 import os
 import sys
+import subprocess
+
+def ensure_dependencies():
+    """Checks for required dependencies and asks user permission before auto-installing."""
+    required = ["rich", "pyserial"]
+    missing = []
+    
+    for pkg in required:
+        try:
+            if pkg == "pyserial":
+                import serial
+            else:
+                __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+
+    if missing:
+        print(f"[!] The following required packages are missing: {', '.join(missing)}")
+        choice = input("[?] Do you want to proceed with downloading dependencies? (y/n): ").strip().lower()
+        if choice in ['y', 'yes']:
+            print("[+] Installing missing dependencies...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+                print("[+] Dependencies successfully installed!\n")
+            except Exception as e:
+                print(f"[-] Installation failed: {e}")
+                sys.exit(1)
+        else:
+            print("[!] Cannot continue without required dependencies. Exiting.")
+            sys.exit(0)
+
+ensure_dependencies()
+
 import time
 import queue
 import threading
-import subprocess
 import re
 import serial
 import serial.tools.list_ports
-
-# Auto-install Rich UI dependency if missing
-try:
-    from rich.live import Live
-    from rich.table import Table
-    from rich.console import Console
-except ImportError:
-    print("[+] Missing requirement 'rich'. Installing automatically...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "rich", "pyserial"])
-    from rich.live import Live
-    from rich.table import Table
-    from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.console import Console
 
 BAUD_RATE = 9600
 WORKER_SCRIPT_NAME = "sanitization-script.py"
@@ -35,19 +58,13 @@ class PortWorker(threading.Thread):
         self.model = "N/A"
         self.serial_num = "N/A"
         
-        # State Lock Flags
         self.is_locked = False
-        self.sanitization_completed = False  # Prevents infinite re-run loops on success
-        
+        self.sanitization_completed = False
         self.stop_requested = False
         self.switch_powered_on = False
         self.process = None
 
     def check_switch_power(self) -> bool:
-        """
-        Detects if the target switch is powered on on the other side of the serial cable
-        by inspecting DSR/CTS handshaking pin voltage or active RX buffer traffic.
-        """
         try:
             ser = serial.Serial(self.port, BAUD_RATE, timeout=0.2)
             if ser.cts or ser.dsr or ser.in_waiting > 0:
@@ -62,14 +79,12 @@ class PortWorker(threading.Thread):
         script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), WORKER_SCRIPT_NAME)
 
         while not self.stop_requested:
-            # 1. Check if the port is locked following a successful completion
             if self.is_locked or self.sanitization_completed:
                 self.status = "COMPLETE (LOCKED - REQUIRING USER RESET)"
                 self.progress = 100
                 time.sleep(1)
                 continue
 
-            # 2. Monitor host connection & Switch Power-On
             self.switch_powered_on = self.check_switch_power()
 
             if not self.switch_powered_on:
@@ -78,13 +93,11 @@ class PortWorker(threading.Thread):
                 time.sleep(1.5)
                 continue
 
-            # 3. Switch detected online! Launch background sanitization
             self.status = "SANITIZING IN BACKGROUND"
             self.progress = 10
             script_succeeded = False
 
             try:
-                # Spawns sanitization-script.py <port_name> in background
                 self.process = subprocess.Popen(
                     [sys.executable, script_path, self.port],
                     stdout=subprocess.PIPE,
@@ -93,14 +106,12 @@ class PortWorker(threading.Thread):
                     bufsize=1
                 )
 
-                # Monitor real-time telemetry output from sanitization-script.py
                 for line in iter(self.process.stdout.readline, ''):
                     if self.stop_requested:
                         break
                     
                     cleaned_line = line.strip()
                     
-                    # Parse status tags sent by sanitization-script.py
                     if "[STATUS:IN_PROGRESS]" in cleaned_line:
                         if self.status != "RECOVERY/RESET IN PROGRESS":
                             self.status = "SANITIZING IN BACKGROUND"
@@ -115,7 +126,6 @@ class PortWorker(threading.Thread):
                         if match:
                             self.progress = int(match.group(1))
 
-                    # Parse hardware identification tags
                     if "Model Tag:" in cleaned_line:
                         match = re.search(r"Model Tag:\s*([A-Za-z0-9\-]+)", cleaned_line)
                         if match:
@@ -127,15 +137,12 @@ class PortWorker(threading.Thread):
 
                 self.process.wait()
 
-                # Evaluate execution results
                 if self.process.returncode == 0 or script_succeeded:
-                    # SUCCESS: Lock port to avoid endless loops
                     self.status = "COMPLETE (LOCKED)"
                     self.progress = 100
                     self.sanitization_completed = True
                     self.is_locked = True
                 else:
-                    # FAILURE/DISCONNECT MID-WAY: Reset progress & prepare for auto-restart on reconnect
                     self.status = "FAILED / REPOWER REQUIRED"
                     self.progress = 0
                     self.sanitization_completed = False
@@ -149,7 +156,6 @@ class PortWorker(threading.Thread):
                 time.sleep(3)
 
     def stop(self):
-        """Cleanly terminates worker thread and child processes."""
         self.stop_requested = True
         if self.process and self.process.poll() is None:
             try:
@@ -158,7 +164,6 @@ class PortWorker(threading.Thread):
                 pass
 
     def unlock_and_reset(self):
-        """User manual unlock command to clear state for a new switch on this cable."""
         self.is_locked = False
         self.sanitization_completed = False
         self.status = "WAITING FOR SWITCH POWER"
@@ -167,15 +172,17 @@ class PortWorker(threading.Thread):
         self.serial_num = "N/A"
 
     def open_interactive_terminal(self):
-        """Spawns an independent terminal window connected directly to this port."""
+        """Spawns an independent terminal window using PySerial's built-in miniterm."""
+        miniterm_cmd = f'"{sys.executable}" -m serial.tools.miniterm {self.port} {BAUD_RATE}'
+        
         if sys.platform == 'darwin':  # macOS
-            cmd = f"osascript -e 'tell application \"Terminal\" to do script \"screen {self.port} {BAUD_RATE}\"'"
+            cmd = f'osascript -e \'tell application "Terminal" to do script "{miniterm_cmd}"\''
             subprocess.Popen(cmd, shell=True)
         elif os.name == 'nt':  # Windows
-            cmd = f"start cmd /k mode {self.port}:{BAUD_RATE},n,8,1"
+            cmd = f'start cmd /k "{miniterm_cmd}"'
             subprocess.Popen(cmd, shell=True)
         else:  # Linux
-            subprocess.Popen(["xterm", "-e", f"screen {self.port} {BAUD_RATE}"])
+            subprocess.Popen(["xterm", "-e", miniterm_cmd])
 
 
 class MassSanitizationManager:
@@ -184,13 +191,21 @@ class MassSanitizationManager:
         self.console = Console()
 
     def discover_ports(self):
-        """Finds all active FTDI, Prolific, or USB-to-Serial adapters connected to host."""
         matched_ports = []
         for port in serial.tools.list_ports.comports():
+            device = port.device
+            
+            if sys.platform == 'darwin' and '/dev/tty.' in device:
+                device = device.replace('/dev/tty.', '/dev/cu.')
+
             desc = (port.description or "").lower()
             mfg = (port.manufacturer or "").lower()
-            if any(chip in desc or chip in mfg for chip in ["ftdi", "prolific", "cp210", "ch340", "usb serial", "usb-to-serial", "tty.usb"]):
-                matched_ports.append(port.device)
+            dev_lower = device.lower()
+
+            keywords = ["ftdi", "prolific", "cp210", "ch340", "usb serial", "usb-to-serial", "usbserial", "cu.usb"]
+            if any(chip in desc or chip in mfg or chip in dev_lower for chip in keywords):
+                if device not in matched_ports:
+                    matched_ports.append(device)
         return matched_ports
 
     def generate_dashboard(self) -> Table:
@@ -204,14 +219,13 @@ class MassSanitizationManager:
         table.add_column("Progress", width=25)
 
         for idx, (port, worker) in enumerate(list(self.workers.items())):
-            # Dynamic bar coloring based on status state
             color = "green"
             if "PAUSED" in worker.status or "MANUAL" in worker.status:
-                color = "grey50"  # Grey on manual interactive override (Ctrl+S)
+                color = "grey50"
             elif "ERROR" in worker.status or "FAILED" in worker.status:
-                color = "red"     # Red on failures or lockouts
+                color = "red"
             elif "COMPLETE" in worker.status:
-                color = "cyan"    # Cyan on complete state
+                color = "cyan"
 
             blocks = int(worker.progress / 5)
             p_bar = f"[{color}]{'█' * blocks}{'░' * (20 - blocks)} {worker.progress}%[/{color}]"
@@ -236,13 +250,11 @@ class MassSanitizationManager:
                 while True:
                     current_ports = self.discover_ports()
 
-                    # 1. Clean up unplugged host ports (unplugged host cables unlock and reset on reconnect)
                     for existing_port in list(self.workers.keys()):
                         if existing_port not in current_ports:
                             self.workers[existing_port].stop()
                             del self.workers[existing_port]
 
-                    # 2. Add newly plugged host serial ports
                     for p in current_ports:
                         if p not in self.workers:
                             worker = PortWorker(p)

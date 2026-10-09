@@ -3,19 +3,33 @@ import subprocess
 import os
 
 def ensure_dependencies():
-    """Checks for required dependencies and auto-installs missing packages."""
-    try:
-        import serial
-        import serial.tools.list_ports
-    except ImportError:
-        print("[+] Missing required dependency 'pyserial'. Auto-installing...")
+    """Checks for required dependencies and asks user permission before auto-installing."""
+    required = ["pyserial"]
+    missing = []
+    
+    for pkg in required:
         try:
-            python_executable = sys.executable
-            subprocess.check_call([python_executable, "-m", "pip", "install", "pyserial"])
-            print("[+] Dependency 'pyserial' successfully installed!\r\n")
-        except Exception as e:
-            print(f"[-] Auto-installation failed: {e}")
-            sys.exit(1)
+            if pkg == "pyserial":
+                import serial
+            else:
+                __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+
+    if missing:
+        print(f"[!] Missing required package: {', '.join(missing)}")
+        choice = input("[?] Do you want to proceed with downloading dependencies? (y/n): ").strip().lower()
+        if choice in ['y', 'yes']:
+            print("[+] Installing missing dependencies...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+                print("[+] Dependency successfully installed!\r\n")
+            except Exception as e:
+                print(f"[-] Auto-installation failed: {e}")
+                sys.exit(1)
+        else:
+            print("[!] Cannot continue without required dependencies. Exiting.")
+            sys.exit(0)
 
 ensure_dependencies()
 
